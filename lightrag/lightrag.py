@@ -1166,19 +1166,32 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
             namespace=NameSpace.VECTOR_STORE_ENTITIES,
             workspace=self.workspace,
             embedding_func=self.embedding_func,
-            meta_fields={"entity_name", "source_id", "content", "file_path"},
+            # ``roles``: RBAC roles union for this entity (see ACL_PLAN.md);
+            # NULL/absent => open. Carried so non-PG backends round-trip it for
+            # post-retrieval filtering, and PG can pre-filter on the column.
+            meta_fields={"entity_name", "source_id", "content", "file_path", "roles"},
         )
         self.relationships_vdb: BaseVectorStorage = self.vector_db_storage_cls(  # type: ignore
             namespace=NameSpace.VECTOR_STORE_RELATIONSHIPS,
             workspace=self.workspace,
             embedding_func=self.embedding_func,
-            meta_fields={"src_id", "tgt_id", "source_id", "content", "file_path"},
+            # ``roles``: RBAC roles union for this relation (see ACL_PLAN.md).
+            meta_fields={
+                "src_id",
+                "tgt_id",
+                "source_id",
+                "content",
+                "file_path",
+                "roles",
+            },
         )
         self.chunks_vdb: BaseVectorStorage = self.vector_db_storage_cls(  # type: ignore
             namespace=NameSpace.VECTOR_STORE_CHUNKS,
             workspace=self.workspace,
             embedding_func=self.embedding_func,
-            meta_fields={"full_doc_id", "content", "file_path"},
+            # ``roles``: RBAC access-control roles (see ACL_PLAN.md), carried so
+            # non-PG backends persist them too; NULL/absent => open chunk.
+            meta_fields={"full_doc_id", "content", "file_path", "roles"},
         )
 
         # Initialize document status storage
@@ -1395,6 +1408,7 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
         ids: str | list[str] | None = None,
         file_paths: str | list[str] | None = None,
         track_id: str | None = None,
+        allowed_roles: list[str] | list[list[str]] | None = None,
     ) -> str:
         """Sync Insert documents with checkpoint support
 
@@ -1407,6 +1421,9 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
             ids: single string of the document ID or list of unique document IDs, if not provided, MD5 hash IDs will be generated
             file_paths: single string of the file path or list of file paths, used for citation
             track_id: tracking ID for monitoring processing status, if not provided, will be generated
+            allowed_roles: document-based access-control roles (RBAC, see ACL_PLAN.md).
+                A single list[str] is broadcast to every document; a list[list[str]]
+                is aligned per-document. Omitted/empty => "open" (visible to all).
 
         Returns:
             str: tracking ID for monitoring processing status
@@ -1419,6 +1436,7 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
                 ids,
                 file_paths,
                 track_id,
+                allowed_roles=allowed_roles,
             ),
             sync_name="insert",
             async_name="ainsert",
@@ -1433,6 +1451,7 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
         ids: str | list[str] | None = None,
         file_paths: str | list[str] | None = None,
         track_id: str | None = None,
+        allowed_roles: list[str] | list[list[str]] | None = None,
     ) -> str:
         """Async insert documents with checkpoint support (fixed-token chunking only).
 
@@ -1463,6 +1482,10 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
             ids: list of unique document IDs, if not provided, MD5 hash IDs will be generated
             file_paths: list of file paths corresponding to each document, used for citation
             track_id: tracking ID for monitoring processing status, if not provided, will be generated
+            allowed_roles: document-based access-control roles (RBAC, see ACL_PLAN.md).
+                A single list[str] is broadcast to every document; a list[list[str]]
+                is aligned per-document. Omitted/empty => the document is "open"
+                (visible to every query), preserving pre-RBAC behaviour.
 
         Returns:
             str: tracking ID for monitoring processing status
@@ -1489,6 +1512,7 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
             file_paths,
             track_id,
             chunk_options=chunk_opts,
+            allowed_roles=allowed_roles,
         )
         await self.apipeline_process_enqueue_documents()
 
@@ -2050,6 +2074,66 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
             if update_storage:
                 await self._insert_done_with_cleanup()
 
+    # Storage classes verified to enforce RBAC: either they pre-filter in-DB on
+    # the ``roles`` column (Postgres), or they round-trip the ``roles`` metadata
+    # / graph property faithfully so the query layer can post-filter retrieved
+    # results (NanoVectorDB, NetworkX, JSON-KV). Any other backend carrying a
+    # query ``user_roles`` is rejected rather than served unfiltered — see the
+    # "Hart ablehnen" decision in ACL_PLAN.md.
+    _ACL_CAPABLE_VECTOR_STORAGES = frozenset(
+        {"PGVectorStorage", "NanoVectorDBStorage"}
+    )
+    _ACL_CAPABLE_GRAPH_STORAGES = frozenset(
+        {"PGGraphStorage", "NetworkXStorage"}
+    )
+    _ACL_CAPABLE_KV_STORAGES = frozenset({"PGKVStorage", "JsonKVStorage"})
+
+    def _enforce_acl_capability(self, param: QueryParam) -> None:
+        """Raise if ``param.user_roles`` is set but a backend cannot enforce ACL.
+
+        Honors the "hard reject" decision: a role-scoped query must never run
+        unfiltered. A backend is acceptable when it pre-filters in-DB or is
+        verified to round-trip ``roles`` for the post-retrieval filter. Open
+        queries (``user_roles is None``) skip the check entirely — fully
+        backward compatible.
+        """
+        if getattr(param, "user_roles", None) is None:
+            return
+
+        incapable: list[str] = []
+        checks = (
+            (self.entities_vdb, self._ACL_CAPABLE_VECTOR_STORAGES, "entities_vdb"),
+            (
+                self.relationships_vdb,
+                self._ACL_CAPABLE_VECTOR_STORAGES,
+                "relationships_vdb",
+            ),
+            (self.chunks_vdb, self._ACL_CAPABLE_VECTOR_STORAGES, "chunks_vdb"),
+            (
+                self.chunk_entity_relation_graph,
+                self._ACL_CAPABLE_GRAPH_STORAGES,
+                "chunk_entity_relation_graph",
+            ),
+            (self.text_chunks, self._ACL_CAPABLE_KV_STORAGES, "text_chunks"),
+        )
+        for storage, capable_set, label in checks:
+            if storage is None:
+                continue
+            # ``supports_acl_prefilter`` lets a backend opt in explicitly without
+            # being hard-coded in the allowlist above.
+            if getattr(storage, "supports_acl_prefilter", False):
+                continue
+            if type(storage).__name__ not in capable_set:
+                incapable.append(f"{label}={type(storage).__name__}")
+
+        if incapable:
+            raise ValueError(
+                "Query was given user_roles (RBAC access control), but these "
+                "storage backends are not ACL-capable and would serve unfiltered "
+                f"data: {', '.join(incapable)}. Use Postgres (or another verified "
+                "ACL backend) for role-scoped queries, or omit user_roles."
+            )
+
     def query(
         self,
         query: str,
@@ -2245,6 +2329,10 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
         """
         global_config = self._build_global_config()
 
+        # (RBAC) Reject the query up front if it carries user_roles but the
+        # active storage backends cannot enforce access control.
+        self._enforce_acl_capability(param)
+
         # Create a copy of param to avoid modifying the original
         data_param = QueryParam(
             mode=param.mode,
@@ -2262,6 +2350,9 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
             conversation_history=param.conversation_history,
             user_prompt=param.user_prompt,
             enable_rerank=param.enable_rerank,
+            # (RBAC) carry the caller's roles into the retrieval copy, otherwise
+            # the data API would silently run unfiltered.
+            user_roles=param.user_roles,
         )
 
         query_result = None
@@ -2361,6 +2452,10 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
         logger.debug(f"[aquery_llm] Query param: {param}")
 
         global_config = self._build_global_config()
+
+        # (RBAC) Reject the query up front if it carries user_roles but the
+        # active storage backends cannot enforce access control.
+        self._enforce_acl_capability(param)
 
         try:
             query_result = None

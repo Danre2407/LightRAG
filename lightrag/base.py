@@ -156,6 +156,15 @@ class QueryParam:
     containing citation information for the retrieved content.
     """
 
+    user_roles: list[str] | None = None
+    """RBAC roles of the querying user (see ACL_PLAN.md). When set, retrieval is
+    filtered so only elements whose roles overlap (or that are open) are visible,
+    and entity/relation descriptions are reassembled from allowed fragments only.
+    ``None`` (default) disables filtering — fully backward compatible.
+    Requires ACL-capable storage backends; a query with ``user_roles`` against a
+    non-ACL backend is rejected rather than served unfiltered.
+    """
+
 
 @dataclass
 class StorageNameSpace(ABC):

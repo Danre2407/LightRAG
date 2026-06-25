@@ -255,6 +255,35 @@ def _safe_index_name(table_name: str, index_suffix: str) -> str:
     return shortened_name
 
 
+def _normalize_roles_for_storage(value: Any) -> list[str] | None:
+    """Coerce an RBAC ``roles`` value to a ``text[]``-bindable list or NULL.
+
+    Part of the document-based access-control layer (see ``ACL_PLAN.md``).
+    Accepts a single role string or an iterable of role strings, trims and
+    de-duplicates (order-preserving), and returns ``None`` when nothing usable
+    remains so the column is stored as SQL ``NULL`` — the "open" sentinel that
+    a query-time ``roles && $N`` pre-filter treats as visible to everyone.
+    """
+    if value is None:
+        return None
+    if isinstance(value, str):
+        items: list[Any] = [value]
+    elif isinstance(value, (list, tuple, set)):
+        items = list(value)
+    else:
+        return None
+    seen: set[str] = set()
+    roles: list[str] = []
+    for item in items:
+        if not isinstance(item, str):
+            continue
+        role = item.strip()
+        if role and role not in seen:
+            seen.add(role)
+            roles.append(role)
+    return roles or None
+
+
 def _timing_details_suffix(**details: Any) -> str:
     parts = [f"{key}={value}" for key, value in details.items()]
     return f" {' '.join(parts)}" if parts else ""
@@ -1599,6 +1628,61 @@ class PostgreSQLDB:
                     f"Failed to add column {col_name} to LIGHTRAG_DOC_CHUNKS: {e}"
                 )
 
+    async def _migrate_chunks_add_roles(self):
+        """Add the RBAC ``roles TEXT[]`` column + GIN index to the ACL tables.
+
+        Part of the document-based access-control layer (see ``ACL_PLAN.md``).
+        ``roles`` carries each row's access roles (chunk source-document roles,
+        or the open-dominant union for entity/relation rows); NULL means the row
+        is "open". The GIN indexes on the vector tables back the query-time
+        ``roles && $N`` overlap pre-filter. Additive and idempotent: existing
+        rows get NULL (open), preserving pre-RBAC behaviour.
+        """
+        targets = [
+            ("lightrag_doc_chunks", "LIGHTRAG_DOC_CHUNKS", False),
+            ("lightrag_vdb_chunks", "LIGHTRAG_VDB_CHUNKS", True),
+            ("lightrag_vdb_entity", "LIGHTRAG_VDB_ENTITY", True),
+            ("lightrag_vdb_relation", "LIGHTRAG_VDB_RELATION", True),
+        ]
+        for table_lower, table_upper, wants_index in targets:
+            try:
+                existing = await self.query(
+                    """
+                    SELECT column_name
+                    FROM information_schema.columns
+                    WHERE table_name = $1 AND column_name = 'roles'
+                    """,
+                    [table_lower],
+                    multirows=True,
+                )
+            except Exception as e:
+                logger.warning(
+                    f"Failed to inspect {table_upper} columns for roles migration: {e}"
+                )
+                existing = None
+
+            if not existing:
+                try:
+                    await self.execute(
+                        f"ALTER TABLE {table_upper} ADD COLUMN roles TEXT[] NULL"
+                    )
+                    logger.info(f"Added roles column to {table_upper} table")
+                except Exception as e:
+                    logger.error(f"Failed to add roles column to {table_upper}: {e}")
+                    continue
+
+            if wants_index:
+                index_name = _safe_index_name(table_lower, "roles_gin")
+                try:
+                    await self.execute(
+                        f"CREATE INDEX IF NOT EXISTS {index_name} "
+                        f"ON {table_upper} USING GIN (roles)"
+                    )
+                except Exception as e:
+                    logger.warning(
+                        f"Failed to create roles GIN index on {table_upper}: {e}"
+                    )
+
     async def _migrate_field_lengths(self):
         """Migrate database field lengths: entity_name, source_id, target_id, and file_path"""
         # Define the field changes needed
@@ -1934,6 +2018,15 @@ class PostgreSQLDB:
         except Exception as e:
             logger.error(
                 f"PostgreSQL, Failed to migrate LIGHTRAG_DOC_CHUNKS heading/sidecar fields: {e}"
+            )
+
+        # Migrate chunk tables to add the RBAC roles TEXT[] column (+ GIN index
+        # on the VDB table for the query-time && pre-filter). See ACL_PLAN.md.
+        try:
+            await self._migrate_chunks_add_roles()
+        except Exception as e:
+            logger.error(
+                f"PostgreSQL, Failed to migrate chunk tables roles field: {e}"
             )
 
     async def _migrate_create_full_entities_relations_tables(self):
@@ -2936,7 +3029,7 @@ class PGKVStorage(BaseKVStorage):
             for i, (k, v) in enumerate(data.items(), start=1):
                 # Tuple order must match SQL: (workspace, id, tokens, chunk_order_index,
                 #   full_doc_id, content, file_path, llm_cache_list, heading, sidecar,
-                #   create_time, update_time)
+                #   roles, create_time, update_time)
                 batch_values.append(
                     (
                         self.workspace,
@@ -2949,6 +3042,8 @@ class PGKVStorage(BaseKVStorage):
                         json.dumps(v.get("llm_cache_list", [])),
                         json.dumps(v.get("heading") or {}),
                         json.dumps(v.get("sidecar") or {}),
+                        # RBAC roles (see ACL_PLAN.md); None => open chunk.
+                        _normalize_roles_for_storage(v.get("roles")),
                         current_time,
                         current_time,
                     )
@@ -3860,8 +3955,9 @@ class PGVectorStorage(BaseVectorStorage):
                 item["content"],  # $6
                 item["__vector__"],  # $7 - numpy array, handled by pgvector codec
                 item["file_path"],  # $8
-                current_time,  # $9
+                _normalize_roles_for_storage(item.get("roles")),  # $9 RBAC roles
                 current_time,  # $10
+                current_time,  # $11
             )
         except Exception as e:
             logger.error(
@@ -3895,8 +3991,9 @@ class PGVectorStorage(BaseVectorStorage):
             item["__vector__"],  # $5 - numpy array, handled by pgvector codec
             chunk_ids,  # $6
             item.get("file_path", None),  # $7
-            current_time,  # $8
+            _normalize_roles_for_storage(item.get("roles")),  # $8 (RBAC)
             current_time,  # $9
+            current_time,  # $10
         )
         return upsert_sql, values
 
@@ -3927,8 +4024,9 @@ class PGVectorStorage(BaseVectorStorage):
             item["__vector__"],  # $6 - numpy array, handled by pgvector codec
             chunk_ids,  # $7
             item.get("file_path", None),  # $8
-            current_time,  # $9
+            _normalize_roles_for_storage(item.get("roles")),  # $9 (RBAC)
             current_time,  # $10
+            current_time,  # $11
         )
         return upsert_sql, values
 
@@ -4254,8 +4352,18 @@ class PGVectorStorage(BaseVectorStorage):
             )
 
     #################### query method ###############
+    # (RBAC) This backend pre-filters the top-k by ``roles`` inside the DB via
+    # the ``$5`` overlap predicate, so forbidden items never enter the result
+    # set. Storages without this flag must not silently serve unfiltered data
+    # when a query carries ``user_roles`` (the query layer hard-rejects them).
+    supports_acl_prefilter = True
+
     async def query(
-        self, query: str, top_k: int, query_embedding: list[float] = None
+        self,
+        query: str,
+        top_k: int,
+        query_embedding: list[float] = None,
+        user_roles: list[str] | None = None,
     ) -> list[dict[str, Any]]:
         if query_embedding is not None:
             embedding = query_embedding
@@ -4276,11 +4384,17 @@ class PGVectorStorage(BaseVectorStorage):
         sql = SQL_TEMPLATES[self.namespace].format(
             table_name=self.table_name, vector_cast=vector_cast
         )
+        # (RBAC) $5 carries the caller's roles for the in-DB pre-filter. ``None``
+        # (no filter) and rows with NULL roles (open) both pass — see the
+        # ``($5::text[] IS NULL OR roles IS NULL OR roles && $5::text[])``
+        # predicate in the chunks/entities/relationships templates.
+        roles_param = _normalize_roles_for_storage(user_roles)
         params = {
             "workspace": self.workspace,
             "closer_than_threshold": 1 - self.cosine_better_than_threshold,
             "top_k": top_k,
             "embedding": embedding,
+            "user_roles": roles_param,
         }
         results = await self.db.query(sql, params=list(params.values()), multirows=True)
         return results
@@ -7996,6 +8110,9 @@ TABLES = {
                     llm_cache_list JSONB NULL DEFAULT '[]'::jsonb,
                     heading JSONB NULL DEFAULT '{}'::jsonb,
                     sidecar JSONB NULL DEFAULT '{}'::jsonb,
+                    -- RBAC access-control roles (see ACL_PLAN.md). NULL => the
+                    -- chunk is "open" (visible to every query).
+                    roles TEXT[] NULL,
                     create_time TIMESTAMP(0) DEFAULT CURRENT_TIMESTAMP,
                     update_time TIMESTAMP(0) DEFAULT CURRENT_TIMESTAMP,
 	                CONSTRAINT LIGHTRAG_DOC_CHUNKS_PK PRIMARY KEY (workspace, id)
@@ -8011,6 +8128,9 @@ TABLES = {
                     content TEXT,
                     content_vector VECTOR(dimension),
                     file_path TEXT NULL,
+                    -- RBAC access-control roles (see ACL_PLAN.md). NULL => the
+                    -- chunk is "open"; pre-filtered at query time via && overlap.
+                    roles TEXT[] NULL,
                     create_time TIMESTAMP(0) DEFAULT CURRENT_TIMESTAMP,
                     update_time TIMESTAMP(0) DEFAULT CURRENT_TIMESTAMP,
 	                CONSTRAINT LIGHTRAG_VDB_CHUNKS_PK PRIMARY KEY (workspace, id)
@@ -8027,6 +8147,7 @@ TABLES = {
                     update_time TIMESTAMP(0) DEFAULT CURRENT_TIMESTAMP,
                     chunk_ids VARCHAR(255)[] NULL,
                     file_path TEXT NULL,
+                    roles TEXT[] NULL,
 	                CONSTRAINT LIGHTRAG_VDB_ENTITY_PK PRIMARY KEY (workspace, id)
                     )"""
     },
@@ -8042,6 +8163,7 @@ TABLES = {
                     update_time TIMESTAMP(0) DEFAULT CURRENT_TIMESTAMP,
                     chunk_ids VARCHAR(255)[] NULL,
                     file_path TEXT NULL,
+                    roles TEXT[] NULL,
 	                CONSTRAINT LIGHTRAG_VDB_RELATION_PK PRIMARY KEY (workspace, id)
                     )"""
     },
@@ -8146,6 +8268,7 @@ SQL_TEMPLATES = {
                                 COALESCE(llm_cache_list, '[]'::jsonb) as llm_cache_list,
                                 COALESCE(heading, '{}'::jsonb) as heading,
                                 COALESCE(sidecar, '{}'::jsonb) as sidecar,
+                                roles,
                                 EXTRACT(EPOCH FROM create_time)::BIGINT as create_time,
                                 EXTRACT(EPOCH FROM update_time)::BIGINT as update_time
                                 FROM LIGHTRAG_DOC_CHUNKS WHERE workspace=$1 AND id=$2
@@ -8170,6 +8293,7 @@ SQL_TEMPLATES = {
                                   COALESCE(llm_cache_list, '[]'::jsonb) as llm_cache_list,
                                   COALESCE(heading, '{}'::jsonb) as heading,
                                   COALESCE(sidecar, '{}'::jsonb) as sidecar,
+                                  roles,
                                   EXTRACT(EPOCH FROM create_time)::BIGINT as create_time,
                                   EXTRACT(EPOCH FROM update_time)::BIGINT as update_time
                                    FROM LIGHTRAG_DOC_CHUNKS WHERE workspace=$1 AND id = ANY($2)
@@ -8277,8 +8401,8 @@ SQL_TEMPLATES = {
                                      """,
     "upsert_text_chunk": """INSERT INTO LIGHTRAG_DOC_CHUNKS (workspace, id, tokens,
                       chunk_order_index, full_doc_id, content, file_path, llm_cache_list,
-                      heading, sidecar, create_time, update_time)
-                      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+                      heading, sidecar, roles, create_time, update_time)
+                      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::text[], $12, $13)
                       ON CONFLICT (workspace,id) DO UPDATE
                       SET tokens=EXCLUDED.tokens,
                       chunk_order_index=EXCLUDED.chunk_order_index,
@@ -8288,6 +8412,7 @@ SQL_TEMPLATES = {
                       llm_cache_list=EXCLUDED.llm_cache_list,
                       heading=EXCLUDED.heading,
                       sidecar=EXCLUDED.sidecar,
+                      roles=EXCLUDED.roles,
                       update_time = EXCLUDED.update_time
                      """,
     "upsert_full_entities": """INSERT INTO LIGHTRAG_FULL_ENTITIES (workspace, id, entity_names, count,
@@ -8325,8 +8450,8 @@ SQL_TEMPLATES = {
     # SQL for VectorStorage
     "upsert_chunk": """INSERT INTO {table_name} (workspace, id, tokens,
                       chunk_order_index, full_doc_id, content, content_vector, file_path,
-                      create_time, update_time)
-                      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                      roles, create_time, update_time)
+                      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::text[], $10, $11)
                       ON CONFLICT (workspace,id) DO UPDATE
                       SET tokens=EXCLUDED.tokens,
                       chunk_order_index=EXCLUDED.chunk_order_index,
@@ -8334,22 +8459,24 @@ SQL_TEMPLATES = {
                       content = EXCLUDED.content,
                       content_vector=EXCLUDED.content_vector,
                       file_path=EXCLUDED.file_path,
+                      roles=EXCLUDED.roles,
                       update_time = EXCLUDED.update_time
                      """,
     "upsert_entity": """INSERT INTO {table_name} (workspace, id, entity_name, content,
-                      content_vector, chunk_ids, file_path, create_time, update_time)
-                      VALUES ($1, $2, $3, $4, $5, $6::varchar[], $7, $8, $9)
+                      content_vector, chunk_ids, file_path, roles, create_time, update_time)
+                      VALUES ($1, $2, $3, $4, $5, $6::varchar[], $7, $8::text[], $9, $10)
                       ON CONFLICT (workspace,id) DO UPDATE
                       SET entity_name=EXCLUDED.entity_name,
                       content=EXCLUDED.content,
                       content_vector=EXCLUDED.content_vector,
                       chunk_ids=EXCLUDED.chunk_ids,
                       file_path=EXCLUDED.file_path,
+                      roles=EXCLUDED.roles,
                       update_time=EXCLUDED.update_time
                      """,
     "upsert_relationship": """INSERT INTO {table_name} (workspace, id, source_id,
-                      target_id, content, content_vector, chunk_ids, file_path, create_time, update_time)
-                      VALUES ($1, $2, $3, $4, $5, $6, $7::varchar[], $8, $9, $10)
+                      target_id, content, content_vector, chunk_ids, file_path, roles, create_time, update_time)
+                      VALUES ($1, $2, $3, $4, $5, $6, $7::varchar[], $8, $9::text[], $10, $11)
                       ON CONFLICT (workspace,id) DO UPDATE
                       SET source_id=EXCLUDED.source_id,
                       target_id=EXCLUDED.target_id,
@@ -8357,8 +8484,12 @@ SQL_TEMPLATES = {
                       content_vector=EXCLUDED.content_vector,
                       chunk_ids=EXCLUDED.chunk_ids,
                       file_path=EXCLUDED.file_path,
+                      roles=EXCLUDED.roles,
                       update_time = EXCLUDED.update_time
                      """,
+    # (RBAC) ``$5`` carries the caller's roles. The predicate keeps a row when
+    # the query has no role filter ($5 NULL), the row is open (roles NULL), or
+    # the two role sets overlap. Forbidden rows are excluded before top-k.
     "relationships": """
                      SELECT source_id AS src_id,
                             target_id AS tgt_id,
@@ -8366,6 +8497,7 @@ SQL_TEMPLATES = {
                      FROM {table_name}
                      WHERE workspace = $1
                        AND content_vector <=> $4::{vector_cast} < $2
+                       AND ($5::text[] IS NULL OR roles IS NULL OR roles && $5::text[])
                      ORDER BY content_vector <=> $4::{vector_cast}
                      LIMIT $3;
                      """,
@@ -8375,6 +8507,7 @@ SQL_TEMPLATES = {
                 FROM {table_name}
                 WHERE workspace = $1
                   AND content_vector <=> $4::{vector_cast} < $2
+                  AND ($5::text[] IS NULL OR roles IS NULL OR roles && $5::text[])
                 ORDER BY content_vector <=> $4::{vector_cast}
                 LIMIT $3;
                 """,
@@ -8386,6 +8519,7 @@ SQL_TEMPLATES = {
               FROM {table_name}
               WHERE workspace = $1
                 AND content_vector <=> $4::{vector_cast} < $2
+                AND ($5::text[] IS NULL OR roles IS NULL OR roles && $5::text[])
               ORDER BY content_vector <=> $4::{vector_cast}
               LIMIT $3;
               """,

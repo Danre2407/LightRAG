@@ -83,6 +83,18 @@ from lightrag.constants import (
     DEFAULT_ENTITY_NAME_MAX_BYTES,
 )
 from lightrag.kg.shared_storage import get_storage_keyed_lock
+from lightrag.acl import (
+    assemble_description,
+    decode_fragments,
+    decode_roles_from_graph,
+    encode_fragments,
+    encode_roles_for_graph,
+    merge_fragments,
+    normalize_roles,
+    roles_overlap,
+    union_roles_from_fragments,
+    LEGACY_FRAGMENT_SOURCE,
+)
 import time
 from dotenv import load_dotenv
 
@@ -2279,6 +2291,45 @@ async def _merge_nodes_then_upsert(
         else:
             logger.debug(status_message)
 
+        # 10.5 (RBAC) Aggregate per-source description fragments + roles union.
+        # Each new node record carries the roles of the chunk it came from
+        # (stamped in extract_entities, S3). We keep one fragment per source so
+        # the description can be re-assembled at query time from only the
+        # fragments the user may see, and derive the node's roles as an
+        # open-dominant union of those fragments. Legacy nodes (a pre-RBAC
+        # description blob, no fragments) contribute one open fragment so they
+        # stay visible. The whole block is skipped unless some roles are present
+        # anywhere, so non-RBAC ingests add no fragment/roles properties.
+        existing_fragments = (
+            decode_fragments(already_node.get("desc_fragments"))
+            if already_node
+            else []
+        )
+        if already_node and not existing_fragments:
+            legacy_desc = (already_node.get("description") or "").strip()
+            if legacy_desc:
+                existing_fragments = [
+                    {
+                        "source_id": LEGACY_FRAGMENT_SOURCE,
+                        "description": legacy_desc,
+                        "roles": None,
+                    }
+                ]
+        new_fragments = [
+            {
+                "source_id": dp.get("source_id"),
+                "description": dp.get("description", ""),
+                "roles": normalize_roles(dp.get("roles")),
+            }
+            for dp in sorted_nodes
+            if dp.get("source_id") and dp.get("description")
+        ]
+        acl_active = any(dp.get("roles") for dp in nodes_data) or any(
+            fr.get("roles") for fr in existing_fragments
+        )
+        node_fragments = merge_fragments(existing_fragments, new_fragments)
+        node_roles = union_roles_from_fragments(node_fragments)
+
         # 11. Update both graph and vector db
         node_data = dict(
             entity_id=entity_name,
@@ -2289,6 +2340,9 @@ async def _merge_nodes_then_upsert(
             created_at=int(time.time()),
             truncate=truncation_info,
         )
+        if acl_active:
+            node_data["roles"] = encode_roles_for_graph(node_roles)
+            node_data["desc_fragments"] = encode_fragments(node_fragments)
         await knowledge_graph_inst.upsert_node(
             entity_name,
             node_data=node_data,
@@ -2310,6 +2364,8 @@ async def _merge_nodes_then_upsert(
                     "file_path": file_path,
                 }
             }
+            if acl_active:
+                data_for_vdb[entity_vdb_id]["roles"] = node_roles
             await safe_vdb_operation_with_exception(
                 operation=lambda payload=data_for_vdb: entity_vdb.upsert(payload),
                 operation_name="entity_upsert",
@@ -2537,6 +2593,39 @@ async def _merge_edges_then_upsert(
             llm_response_cache,
         )
 
+        # 8.5 (RBAC) Aggregate per-source description fragments + roles union
+        # for this edge (mirrors _merge_nodes_then_upsert). Computed here so the
+        # endpoint nodes created/updated below can inherit the edge roles.
+        existing_edge_fragments = (
+            decode_fragments(already_edge.get("desc_fragments"))
+            if already_edge
+            else []
+        )
+        if already_edge and not existing_edge_fragments:
+            legacy_edge_desc = (already_edge.get("description") or "").strip()
+            if legacy_edge_desc:
+                existing_edge_fragments = [
+                    {
+                        "source_id": LEGACY_FRAGMENT_SOURCE,
+                        "description": legacy_edge_desc,
+                        "roles": None,
+                    }
+                ]
+        new_edge_fragments = [
+            {
+                "source_id": dp.get("source_id"),
+                "description": dp.get("description", ""),
+                "roles": normalize_roles(dp.get("roles")),
+            }
+            for dp in sorted_edges
+            if dp.get("source_id") and dp.get("description")
+        ]
+        edge_acl_active = any(dp.get("roles") for dp in edges_data) or any(
+            fr.get("roles") for fr in existing_edge_fragments
+        )
+        edge_fragments = merge_fragments(existing_edge_fragments, new_edge_fragments)
+        edge_roles = union_roles_from_fragments(edge_fragments)
+
         # 9. Build file_path within MAX_FILE_PATHS limit
         file_paths_list = []
         seen_paths = set()
@@ -2649,6 +2738,12 @@ async def _merge_edges_then_upsert(
                     "created_at": node_created_at,
                     "truncate": "",
                 }
+                # (RBAC) A node that exists only because of this edge inherits
+                # the edge's roles/fragments — otherwise an endpoint born from a
+                # confidential relation would default to open and leak.
+                if edge_acl_active:
+                    node_data["roles"] = encode_roles_for_graph(edge_roles)
+                    node_data["desc_fragments"] = encode_fragments(edge_fragments)
                 await knowledge_graph_inst.upsert_node(
                     need_insert_id, node_data=node_data
                 )
@@ -2682,6 +2777,8 @@ async def _merge_edges_then_upsert(
                             "file_path": file_path,
                         }
                     }
+                    if edge_acl_active:
+                        vdb_data[entity_vdb_id]["roles"] = edge_roles
                     await safe_vdb_operation_with_exception(
                         operation=lambda payload=vdb_data: entity_vdb.upsert(payload),
                         operation_name="added_entity_upsert",
@@ -2823,18 +2920,22 @@ async def _merge_edges_then_upsert(
 
         edge_created_at = int(time.time())
         edge_upsert_started = time.perf_counter()
+        edge_graph_data = dict(
+            weight=weight,
+            description=description,
+            keywords=keywords,
+            source_id=source_id,
+            file_path=file_path,
+            created_at=edge_created_at,
+            truncate=truncation_info,
+        )
+        if edge_acl_active:
+            edge_graph_data["roles"] = encode_roles_for_graph(edge_roles)
+            edge_graph_data["desc_fragments"] = encode_fragments(edge_fragments)
         await knowledge_graph_inst.upsert_edge(
             src_id,
             tgt_id,
-            edge_data=dict(
-                weight=weight,
-                description=description,
-                keywords=keywords,
-                source_id=source_id,
-                file_path=file_path,
-                created_at=edge_created_at,
-                truncate=truncation_info,
-            ),
+            edge_data=edge_graph_data,
         )
         edge_upsert_elapsed = time.perf_counter() - edge_upsert_started
         if edge_upsert_elapsed >= 5.0:
@@ -2886,6 +2987,8 @@ async def _merge_edges_then_upsert(
                     "file_path": file_path,
                 }
             }
+            if edge_acl_active:
+                vdb_data[rel_vdb_id]["roles"] = edge_roles
             relation_status_message = f"Upserting relation VDB: `{relation_key}`"
             logger.info(relation_status_message)
             if pipeline_status is not None and pipeline_status_lock is not None:
@@ -3689,6 +3792,21 @@ async def extract_entities(
                         }
                     )
 
+        # S3 (RBAC): stamp the chunk's allowed roles onto every extracted
+        # record (LLM-extracted *and* multimodal-injected) so the merge step
+        # (S4) can aggregate them per-source into the node/edge roles union and
+        # write a per-source description fragment carrying its own ACL. When the
+        # chunk has no roles (open document), nothing is stamped and the record
+        # stays open — fully backward compatible.
+        chunk_roles = chunk_dp.get("roles")
+        if chunk_roles:
+            for _record_list in maybe_nodes.values():
+                for _record in _record_list:
+                    _record["roles"] = list(chunk_roles)
+            for _record_list in maybe_edges.values():
+                for _record in _record_list:
+                    _record["roles"] = list(chunk_roles)
+
         # Batch update chunk's llm_cache_list with all collected cache keys
         if cache_keys_collector and text_chunks_storage:
             await update_chunk_cache_list(
@@ -4255,6 +4373,91 @@ async def extract_keywords_only(
     return hl_keywords, ll_keywords
 
 
+# --------------------------------------------------------------------------- #
+# RBAC query-time enforcement helpers (see ACL_PLAN.md).
+#
+# Two layers work together:
+#  * PG storages pre-filter the vector top-k in-DB on the ``roles`` column
+#    (``supports_acl_prefilter``), so forbidden rows never enter the result set.
+#  * The helpers below are the backend-agnostic enforcement that runs on the
+#    retrieved data regardless of backend: they drop graph nodes/edges and
+#    chunks the user may not see, and rebuild entity/relation descriptions from
+#    only the allowed per-source fragments. This guarantees correctness even on
+#    backends that cannot pre-filter, and closes the mixed-blob leak for
+#    open-but-mixed elements that pass the visibility check.
+# All helpers are no-ops when ``user_roles`` is None (no filter) — fully
+# backward compatible.
+# --------------------------------------------------------------------------- #
+
+
+async def _acl_vdb_query(
+    vdb: BaseVectorStorage,
+    query: str,
+    *,
+    top_k: int,
+    query_embedding,
+    user_roles: list[str] | None,
+):
+    """Vector query that hands ``user_roles`` to pre-filter-capable backends.
+
+    Non-capable backends are called with the legacy signature (no extra kwarg);
+    their results are still filtered downstream by the post-retrieval helpers.
+    """
+    if user_roles and getattr(vdb, "supports_acl_prefilter", False):
+        return await vdb.query(
+            query,
+            top_k=top_k,
+            query_embedding=query_embedding,
+            user_roles=user_roles,
+        )
+    return await vdb.query(query, top_k=top_k, query_embedding=query_embedding)
+
+
+def _acl_filter_graph_elements(
+    elements: list[dict],
+    user_roles: list[str] | None,
+    desc_key: str = "description",
+) -> list[dict]:
+    """Drop nodes/edges the user may not see; rebuild description from fragments.
+
+    An element is visible iff it is open or its roles overlap ``user_roles``.
+    For visible elements that carry per-source ``desc_fragments``, the
+    description is reassembled from only the fragments the user may see — so a
+    visible-but-mixed element never exposes confidential fragment text.
+    """
+    if user_roles is None:
+        return elements
+    kept: list[dict] = []
+    for element in elements:
+        if not roles_overlap(decode_roles_from_graph(element.get("roles")), user_roles):
+            continue
+        fragments = decode_fragments(element.get("desc_fragments"))
+        if fragments:
+            rebuilt = assemble_description(
+                fragments,
+                user_roles,
+                fallback=element.get(desc_key, "") or "",
+            )
+            element = {**element, desc_key: rebuilt}
+        kept.append(element)
+    return kept
+
+
+def _acl_filter_chunks(
+    chunks: list[dict],
+    user_roles: list[str] | None,
+    roles_key: str = "roles",
+) -> list[dict]:
+    """Drop chunks whose roles do not overlap ``user_roles`` (open chunks pass)."""
+    if user_roles is None:
+        return chunks
+    return [
+        chunk
+        for chunk in chunks
+        if roles_overlap(chunk.get(roles_key), user_roles)
+    ]
+
+
 async def _get_vector_context(
     query: str,
     chunks_vdb: BaseVectorStorage,
@@ -4281,9 +4484,17 @@ async def _get_vector_context(
         search_top_k = query_param.chunk_top_k or query_param.top_k
         cosine_threshold = chunks_vdb.cosine_better_than_threshold
 
-        results = await chunks_vdb.query(
-            query, top_k=search_top_k, query_embedding=query_embedding
+        user_roles = normalize_roles(getattr(query_param, "user_roles", None))
+        results = await _acl_vdb_query(
+            chunks_vdb,
+            query,
+            top_k=search_top_k,
+            query_embedding=query_embedding,
+            user_roles=user_roles,
         )
+        # (RBAC) Post-filter on returned roles too: PG already pre-filtered, but
+        # non-PG backends return ``roles`` in metadata and are filtered here.
+        results = _acl_filter_chunks(results, user_roles)
         if not results:
             logger.info(
                 f"Naive query: 0 chunks (chunk_top_k:{search_top_k} cosine:{cosine_threshold})"
@@ -5152,8 +5363,13 @@ async def _get_node_data(
         f"Query nodes: {query} (top_k:{query_param.top_k}, cosine:{entities_vdb.cosine_better_than_threshold})"
     )
 
-    results = await entities_vdb.query(
-        query, top_k=query_param.top_k, query_embedding=query_embedding
+    user_roles = normalize_roles(getattr(query_param, "user_roles", None))
+    results = await _acl_vdb_query(
+        entities_vdb,
+        query,
+        top_k=query_param.top_k,
+        query_embedding=query_embedding,
+        user_roles=user_roles,
     )
 
     if not len(results):
@@ -5185,6 +5401,11 @@ async def _get_node_data(
         for k, n, d in zip(results, node_datas, node_degrees)
         if n is not None
     ]
+
+    # (RBAC) Drop entities the user may not see and rebuild their descriptions
+    # from allowed fragments BEFORE expanding edges, so forbidden entities can
+    # neither appear in context nor seed relation traversal.
+    node_datas = _acl_filter_graph_elements(node_datas, user_roles)
 
     use_relations = await _find_most_related_edges_from_entities(
         node_datas,
@@ -5249,6 +5470,11 @@ async def _find_most_related_edges_from_entities(
                 **edge_props,
             }
             all_edges_data.append(combined)
+
+    # (RBAC) Drop edges the user may not see; rebuild description from fragments.
+    all_edges_data = _acl_filter_graph_elements(
+        all_edges_data, normalize_roles(getattr(query_param, "user_roles", None))
+    )
 
     all_edges_data = sorted(
         all_edges_data, key=lambda x: (x["rank"], x["weight"]), reverse=True
@@ -5413,6 +5639,11 @@ async def _find_related_text_unit_from_entities(
                     "order": i + 1,  # 1-based order in final entity-related results
                 }
 
+    # (RBAC) Drop chunks the user may not see (open chunks pass).
+    result_chunks = _acl_filter_chunks(
+        result_chunks, normalize_roles(getattr(query_param, "user_roles", None))
+    )
+
     return result_chunks
 
 
@@ -5427,8 +5658,13 @@ async def _get_edge_data(
         f"Query edges: {keywords} (top_k:{query_param.top_k}, cosine:{relationships_vdb.cosine_better_than_threshold})"
     )
 
-    results = await relationships_vdb.query(
-        keywords, top_k=query_param.top_k, query_embedding=query_embedding
+    user_roles = normalize_roles(getattr(query_param, "user_roles", None))
+    results = await _acl_vdb_query(
+        relationships_vdb,
+        keywords,
+        top_k=query_param.top_k,
+        query_embedding=query_embedding,
+        user_roles=user_roles,
     )
 
     if not len(results):
@@ -5459,6 +5695,10 @@ async def _get_edge_data(
                 **edge_props,
             }
             edge_datas.append(combined)
+
+    # (RBAC) Drop relations the user may not see; rebuild description from
+    # fragments BEFORE expanding their endpoint entities.
+    edge_datas = _acl_filter_graph_elements(edge_datas, user_roles)
 
     # Relations maintain vector search order (sorted by similarity)
 
@@ -5504,6 +5744,11 @@ async def _find_most_related_entities_from_relationships(
         # Combine the node data with the entity name, no rank needed
         combined = {**node, "entity_name": entity_name}
         node_datas.append(combined)
+
+    # (RBAC) Drop endpoint entities the user may not see; rebuild descriptions.
+    node_datas = _acl_filter_graph_elements(
+        node_datas, normalize_roles(getattr(query_param, "user_roles", None))
+    )
 
     return node_datas
 
@@ -5707,6 +5952,11 @@ async def _find_related_text_unit_from_relations(
                     "frequency": chunk_occurrence_count.get(chunk_id, 1),
                     "order": i + 1,  # 1-based order in final relation-related results
                 }
+
+    # (RBAC) Drop chunks the user may not see (open chunks pass).
+    result_chunks = _acl_filter_chunks(
+        result_chunks, normalize_roles(getattr(query_param, "user_roles", None))
+    )
 
     return result_chunks
 

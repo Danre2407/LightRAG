@@ -10,13 +10,14 @@ __pycache__/
 # Virtual Environment
 .venv/
 venv/
+.venv-acl/
 
 # Enviroment Variable Files
 .env
 .env.backup.*
 
 # Generated Docker Compose files (output of setup wizard)
-docker-compose.*.yml
+# docker-compose.*.yml
 !docker-compose.podman.yml
 
 # Build / Distribution

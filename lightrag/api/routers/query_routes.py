@@ -108,6 +108,17 @@ class QueryRequest(BaseModel):
         description="If True, enables streaming output. Defaults to False for /query, True for /query/stream.",
     )
 
+    user_roles: Optional[List[str]] = Field(
+        default=None,
+        description=(
+            "RBAC roles of the querying user (see ACL_PLAN.md). When set, "
+            "retrieval is filtered to elements whose roles overlap (or are "
+            "open) and descriptions are rebuilt from allowed fragments only. "
+            "Omit => no filter (sees everything). Requires an ACL-capable "
+            "backend (e.g. Postgres); otherwise the query is rejected."
+        ),
+    )
+
     @field_validator("query", mode="after")
     @classmethod
     def query_strip_after(cls, query: str) -> str:

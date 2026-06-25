@@ -1,0 +1,51 @@
+# LightRAG with the local RBAC/ACL patch baked in.
+#
+# Unlike docker-compose.yml (which pulls the published image
+# ghcr.io/hkuds/lightrag:latest and therefore runs UNPATCHED code), this file
+# builds an image from the local source tree. The Dockerfile copies ./lightrag
+# into the image and installs it, so your ACL changes are included.
+#
+# Usage (run from this folder, the LightRAG checkout):
+#   docker compose -f docker-compose.acl.yml up --build
+#
+#   - The first build is slow (frontend + Rust deps); later builds are cached.
+#   - `pull_policy: build` forces a (cache-aware) rebuild on every `up`, so code
+#     changes you make in ./lightrag are always picked up — no stale image.
+#   - The image tag below is local-only and is never fetched from a registry.
+#
+# Verify the patch is live after start:
+#   curl http://localhost:9621/openapi.json | grep allowed_roles
+#
+# NOTE: ./data/rag_storage may still contain documents ingested by the OLD,
+# unpatched server (stored as "open", i.e. visible to every role). Clear it once
+# before re-testing RBAC, e.g.:  rm -rf ./data/rag_storage/*   (or use a fresh
+# WORKING_DIR / volume below).
+
+services:
+  lightrag:
+    image: lightrag-acl:patched          # local-only tag; never pulled
+    pull_policy: build                    # always build from source (cache-aware)
+    build:
+      context: .
+      dockerfile: Dockerfile
+      tags:
+        - lightrag-acl:patched
+    ports:
+      - "${HOST:-0.0.0.0}:${PORT:-9621}:9621"
+    volumes:
+      - ./data/rag_storage:/app/data/rag_storage
+      - ./data/inputs:/app/data/inputs
+      - ./data/prompts:/app/data/prompts
+      - ./.env:/app/.env
+    deploy:
+      restart_policy:
+        condition: on-failure
+        max_attempts: 10
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      WORKING_DIR: "/app/data/rag_storage"
+      INPUT_DIR: "/app/data/inputs"
+      PROMPT_DIR: "/app/data/prompts"
+      HOST: "0.0.0.0"
+      PORT: "9621"

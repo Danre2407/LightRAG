@@ -90,6 +90,7 @@ from lightrag.utils_pipeline import (
     get_existing_doc_by_file_basename,
     has_known_document_source,
     input_dir_path,
+    normalize_allowed_roles,
     normalize_document_file_path,
     doc_status_metadata_has_attempt_fields,
     doc_status_reset_metadata,
@@ -239,6 +240,7 @@ class _PipelineMixin:
         parse_engine: str | list[str] | None = None,
         process_options: str | list[str] | None = None,
         chunk_options: dict | list[dict] | None = None,
+        allowed_roles: list[str] | list[list[str]] | None = None,
         from_scan: bool = False,
     ) -> str:
         """
@@ -285,6 +287,15 @@ class _PipelineMixin:
                 result here; this function is intentionally chunker-
                 config agnostic.  See
                 ``docs/FileProcessingConfiguration-zh.md`` for the schema.
+            allowed_roles: document-based access-control roles (see
+                ``ACL_PLAN.md``).  Accepted as a single ``list[str]``
+                (broadcast to every input) or a ``list[list[str]]``
+                aligned with ``input``.  Each entry is normalized via
+                :func:`normalize_allowed_roles`; an absent/empty value
+                persists as no roles (the "open" default — visible to
+                every query, preserving pre-RBAC behaviour).  Stored on
+                ``doc_status.metadata['allowed_roles']`` so the processing
+                stage can stamp the roles onto chunks/entities/relations.
             from_scan: when True, the caller is the scan-owned background task
                 that already holds ``pipeline_status["scanning"]``.  Scan
                 does additional doc_status reads during its classification
@@ -359,6 +370,15 @@ class _PipelineMixin:
             process_options = [process_options] * len(input)
         if isinstance(chunk_options, dict):
             chunk_options = [chunk_options] * len(input)
+        # Broadcast a single role list (``list[str]``) to every input;
+        # a ``list[list[str]]`` is treated as already per-document.  An
+        # empty list is ambiguous but harmless — broadcasting [] yields
+        # the same "open" result per doc as the per-doc interpretation.
+        if allowed_roles is not None and (
+            len(allowed_roles) == 0
+            or all(isinstance(role, str) for role in allowed_roles)
+        ):
+            allowed_roles = [allowed_roles] * len(input)
 
         # If file_paths is provided, ensure it matches the number of documents
         if file_paths is not None:
@@ -394,6 +414,10 @@ class _PipelineMixin:
         if chunk_options is not None and len(chunk_options) != len(input):
             raise ValueError(
                 "Number of chunk_options dicts must match the number of documents"
+            )
+        if allowed_roles is not None and len(allowed_roles) != len(input):
+            raise ValueError(
+                "Number of allowed_roles entries must match the number of documents"
             )
 
         def _parse_engine_at(index: int) -> str | None:
@@ -457,6 +481,11 @@ class _PipelineMixin:
             if chunk_options is not None:
                 return slim_chunk_options(chunk_options[index], doc_options)
             return resolve_chunk_options(self.addon_params, process_options=doc_options)
+
+        def _allowed_roles_at(index: int) -> list[str] | None:
+            if allowed_roles is None:
+                return None
+            return normalize_allowed_roles(allowed_roles[index])
 
         # 1. Validate ids and build contents (when lightrag: no content dedup, content may be empty)
         if ids is not None:
@@ -556,6 +585,11 @@ class _PipelineMixin:
             # so the per-doc parameters are frozen even when ``F``
             # (default) is used.
             content_data["chunk_options"] = _chunk_options_at(index)
+            # Access-control roles (RBAC, see ACL_PLAN.md). Only stored when
+            # the caller supplied roles for this doc; absent => "open".
+            doc_roles = _allowed_roles_at(index)
+            if doc_roles:
+                content_data["allowed_roles"] = doc_roles
             contents[doc_id] = content_data
 
         # ``ids`` outranks ``docs_format`` by design: explicit ids mark the
@@ -605,6 +639,12 @@ class _PipelineMixin:
             source_file = _read_source_file(content_data)
             if source_file:
                 metadata["source_file"] = source_file
+            # Persist RBAC roles on doc_status.metadata so the processing
+            # stage (_process_single_document) can stamp them onto chunks
+            # and extracted entities/relations. Absent => "open" document.
+            doc_roles = content_data.get("allowed_roles")
+            if doc_roles:
+                metadata["allowed_roles"] = doc_roles
             if metadata:
                 base["metadata"] = metadata
             return base
@@ -2468,8 +2508,20 @@ class _PipelineMixin:
 
                     backfill_chunk_sidecars(chunking_result, blocks_path)
 
+                # RBAC: resolve the document's access-control roles persisted
+                # at enqueue time (doc_status.metadata['allowed_roles'], see
+                # ACL_PLAN.md S1) so every chunk can be stamped with its source
+                # document's roles. Re-normalized defensively in case the row
+                # was written by an older/foreign path. None/empty => open.
+                doc_status_metadata = getattr(status_doc, "metadata", None) or {}
+                doc_allowed_roles = normalize_allowed_roles(
+                    doc_status_metadata.get("allowed_roles")
+                )
                 chunks = build_chunks_dict_from_chunking_result(
-                    chunking_result, doc_id=doc_id, file_path=file_path
+                    chunking_result,
+                    doc_id=doc_id,
+                    file_path=file_path,
+                    allowed_roles=doc_allowed_roles,
                 )
 
                 if not chunks:

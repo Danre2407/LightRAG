@@ -23,6 +23,7 @@ from fastapi import (
     BackgroundTasks,
     Depends,
     File,
+    Form,
     HTTPException,
     UploadFile,
 )
@@ -416,6 +417,14 @@ class InsertTextRequest(BaseModel):
         default=None,
         description="Chunking strategy and params; omit for default fixed-token chunking",
     )
+    allowed_roles: Optional[list[str]] = Field(
+        default=None,
+        description=(
+            "RBAC access-control roles for this document (see ACL_PLAN.md). "
+            "Omit/empty => open (visible to everyone). Propagated to chunks, "
+            "entities and relations; queries filter on overlapping user_roles."
+        ),
+    )
 
     @field_validator("text", mode="after")
     @classmethod
@@ -464,6 +473,14 @@ class InsertTextsRequest(BaseModel):
     chunking: Optional[TextChunkingConfig] = Field(
         default=None,
         description="Shared chunking strategy and params for all texts; omit for default fixed-token chunking",
+    )
+    allowed_roles: Optional[list[str]] = Field(
+        default=None,
+        description=(
+            "RBAC access-control roles applied to every text in this request "
+            "(see ACL_PLAN.md). Omit/empty => open. For per-document roles, "
+            "send separate requests."
+        ),
     )
 
     @field_validator("texts", mode="after")
@@ -1589,6 +1606,7 @@ async def pipeline_enqueue_file(
     file_path: Path,
     track_id: str = None,
     from_scan: bool = False,
+    allowed_roles: Optional[list[str]] = None,
 ) -> tuple[bool, str]:
     """Add a file to the queue for processing
 
@@ -1600,6 +1618,8 @@ async def pipeline_enqueue_file(
             which already holds ``pipeline_status["scanning"]``.  Forwarded to
             ``apipeline_enqueue_documents`` so the scan can enqueue the files
             it just discovered without tripping the scanning guard there.
+        allowed_roles: Optional RBAC roles for this document (see ACL_PLAN.md);
+            None/empty => open (visible to everyone).
     Returns:
         tuple: (success: bool, track_id: str)
     """
@@ -1694,6 +1714,8 @@ async def pipeline_enqueue_file(
             }
             if hint_chunk_options is not None:
                 enqueue_kwargs["chunk_options"] = hint_chunk_options
+            if allowed_roles:
+                enqueue_kwargs["allowed_roles"] = allowed_roles
             enqueue_result = await rag.apipeline_enqueue_documents("", **enqueue_kwargs)
             if enqueue_result is None:
                 try:
@@ -1750,16 +1772,25 @@ async def pipeline_enqueue_file(
                 logger.error(f"Error deleting file {file_path}: {str(e)}")
 
 
-async def pipeline_index_file(rag: LightRAG, file_path: Path, track_id: str = None):
+async def pipeline_index_file(
+    rag: LightRAG,
+    file_path: Path,
+    track_id: str = None,
+    allowed_roles: Optional[list[str]] = None,
+):
     """Index a file with track_id
 
     Args:
         rag: LightRAG instance
         file_path: Path to the saved file
         track_id: Optional tracking ID
+        allowed_roles: Optional RBAC roles for this document (see ACL_PLAN.md);
+            None/empty => open.
     """
     try:
-        success, _ = await pipeline_enqueue_file(rag, file_path, track_id)
+        success, _ = await pipeline_enqueue_file(
+            rag, file_path, track_id, allowed_roles=allowed_roles
+        )
         if success:
             await rag.apipeline_process_enqueue_documents()
 
@@ -1946,6 +1977,7 @@ async def pipeline_index_texts(
     file_sources: List[str] = None,
     track_id: str = None,
     chunking: Optional[TextChunkingConfig] = None,
+    allowed_roles: Optional[list[str]] = None,
 ):
     """Index a list of texts with track_id
 
@@ -1956,6 +1988,8 @@ async def pipeline_index_texts(
         track_id: Optional tracking ID
         chunking: Optional chunking strategy + params (already validated by
             the request model); when None, default fixed-token chunking is used
+        allowed_roles: Optional RBAC roles broadcast to every text (see
+            ACL_PLAN.md); None/empty => open.
     """
     if not texts:
         return
@@ -1976,6 +2010,7 @@ async def pipeline_index_texts(
         track_id=track_id,
         process_options=process_options,
         chunk_options=chunk_options,
+        allowed_roles=allowed_roles,
     )
     await rag.apipeline_process_enqueue_documents()
 
@@ -2564,7 +2599,15 @@ def create_document_routes(
         "/upload", response_model=InsertResponse, dependencies=[Depends(combined_auth)]
     )
     async def upload_to_input_dir(
-        background_tasks: BackgroundTasks, file: UploadFile = File(...)
+        background_tasks: BackgroundTasks,
+        file: UploadFile = File(...),
+        allowed_roles: Optional[List[str]] = Form(
+            default=None,
+            description=(
+                "RBAC access-control roles for this document (see ACL_PLAN.md). "
+                "Repeat the field for multiple roles. Omit => open (everyone)."
+            ),
+        ),
     ):
         """
         Upload a file to the input directory and index it.
@@ -2779,7 +2822,9 @@ def create_document_routes(
             # loop's request_pending mechanism.
             async def _indexing_task():
                 try:
-                    await pipeline_index_file(rag, file_path, track_id)
+                    await pipeline_index_file(
+                        rag, file_path, track_id, allowed_roles=allowed_roles
+                    )
                 finally:
                     await _release_enqueue_slot(rag)
 
@@ -2889,6 +2934,7 @@ def create_document_routes(
                         file_sources=[normalized_file_source],
                         track_id=track_id,
                         chunking=request.chunking,
+                        allowed_roles=request.allowed_roles,
                     )
                 finally:
                     await _release_enqueue_slot(rag)
@@ -3013,6 +3059,7 @@ def create_document_routes(
                         file_sources=normalized_file_sources,
                         track_id=track_id,
                         chunking=request.chunking,
+                        allowed_roles=request.allowed_roles,
                     )
                 finally:
                     await _release_enqueue_slot(rag)

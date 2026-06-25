@@ -40,11 +40,52 @@ PLACEHOLDER_DOCUMENT_SOURCES = {"", "no-file-path", "unknown_source"}
 SIDECAR_LOCATION_UNKNOWN = "unknown_source"
 
 
+def normalize_allowed_roles(value: Any) -> list[str] | None:
+    """Canonicalize a document's ``allowed_roles`` access-control value.
+
+    Part of the document-based RBAC layer (see ``ACL_PLAN.md``). Roles are
+    free-form strings; this normalizer accepts a single role string or an
+    iterable of role strings, then strips whitespace, drops empties, and
+    de-duplicates while preserving first-seen order.
+
+    Returns ``None`` (the "open" sentinel — visible to every query) when no
+    usable role is present, so an absent or empty ``allowed_roles`` keeps the
+    pre-RBAC behaviour. A non-empty result is a stable list suitable for
+    persisting to ``doc_status.metadata['allowed_roles']`` and for stamping
+    onto chunks/entities/relations downstream.
+    """
+    if value is None:
+        return None
+    if isinstance(value, str):
+        items: list[Any] = [value]
+    elif isinstance(value, (list, tuple, set)):
+        items = list(value)
+    else:
+        raise ValueError(
+            f"allowed_roles must be a string or a list of strings, "
+            f"got {type(value).__name__}"
+        )
+
+    seen: set[str] = set()
+    roles: list[str] = []
+    for item in items:
+        if not isinstance(item, str):
+            raise ValueError(
+                f"allowed_roles entries must be strings, got {type(item).__name__}"
+            )
+        role = item.strip()
+        if role and role not in seen:
+            seen.add(role)
+            roles.append(role)
+    return roles or None
+
+
 def build_chunks_dict_from_chunking_result(
     chunking_result: list[dict[str, Any]],
     *,
     doc_id: str,
     file_path: str,
+    allowed_roles: list[str] | None = None,
 ) -> dict[str, dict[str, Any]]:
     """Assemble the per-doc chunks dict written into chunks_vdb / text_chunks.
 
@@ -53,6 +94,12 @@ def build_chunks_dict_from_chunking_result(
     to a positional ``chunk-NNN`` derived from ``chunk_order_index``, and
     finally hashing on collision so two entries inside one document never
     overwrite each other.
+
+    ``allowed_roles`` (document-based RBAC, see ``ACL_PLAN.md``) is the source
+    document's access-control roles. When provided, every chunk is stamped with
+    a copied ``roles`` list (provenance-bound: the chunk inherits exactly its
+    own document's roles). ``None``/empty leaves chunks without a ``roles`` key,
+    i.e. "open" — preserving pre-RBAC behaviour.
     """
     chunks: dict[str, dict[str, Any]] = {}
     for dp in chunking_result:
@@ -91,12 +138,17 @@ def build_chunks_dict_from_chunking_result(
                     seen.add(key)
                     seed_cache_list.append(key)
         stored_chunk = {k: v for k, v in dp.items() if k != "_source_span"}
-        chunks[chunk_key] = {
+        chunk_record = {
             **stored_chunk,
             "full_doc_id": doc_id,
             "file_path": file_path,
             "llm_cache_list": seed_cache_list,
         }
+        # RBAC: stamp this chunk with its source document's roles (a fresh copy
+        # per chunk so callers can't alias the doc-level list). Absent => open.
+        if allowed_roles:
+            chunk_record["roles"] = list(allowed_roles)
+        chunks[chunk_key] = chunk_record
     return chunks
 
 
